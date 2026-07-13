@@ -5,11 +5,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "==> Installing system packages (Tk + Pillow-ImageTk + alsa-utils for notify sound)"
+echo "==> Installing system packages"
+# python3-tk + python3-pil.imagetk : GUI + thumbnails.
+# python3-lxml                     : Readability's parser — installing
+#                                    from apt avoids a slow source build
+#                                    on Pi Zero when pip installs
+#                                    readability-lxml below.
+# alsa-utils                       : aplay, for the notify chime.
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip \
     python3-tk python3-pil.imagetk \
+    python3-lxml \
     alsa-utils
 
 echo "==> Creating virtualenv (.venv) with access to system site packages"

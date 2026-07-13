@@ -42,6 +42,15 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    # readability-lxml — small wrapper around lxml that implements the
+    # Readability algorithm. Optional; falls back to a tag-based extractor
+    # if not installed.
+    from readability import Document as _ReadabilityDocument
+    HAS_READABILITY = True
+except ImportError:
+    HAS_READABILITY = False
+
 
 APP_NAME = "FeedMeSomePi"
 CONFIG_DIR = Path(os.path.expanduser("~")) / ".feedmesomepi"
@@ -100,6 +109,10 @@ class Article:
     published: float
     thumbnail_url: str = ""
     seen: bool = False
+    # Full-text HTML extracted from `link` when available. Empty until we
+    # fetch it (lazily, on preview). Cached back to disk so we only
+    # extract once per article.
+    content: str = ""
     _id: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
@@ -120,6 +133,7 @@ class Article:
             "published": self.published,
             "thumbnail_url": self.thumbnail_url,
             "seen": self.seen,
+            "content": self.content,
         }
 
     @classmethod
@@ -133,6 +147,7 @@ class Article:
             published=data.get("published", 0.0),
             thumbnail_url=data.get("thumbnail_url", ""),
             seen=data.get("seen", False),
+            content=data.get("content", ""),
         )
 
 
@@ -328,6 +343,43 @@ def fetch_thumbnail(url: str, session: requests.Session) -> Path | None:
     return dest
 
 
+# ---------------------------------------------------------------------------
+# Full-text extraction — like fivefilters.org/full-text-rss: fetch the
+# article URL and pull out the main content HTML so we can show more than
+# the excerpt some feeds ship. Uses readability-lxml if available;
+# otherwise falls back to grabbing the first <article> or <main> element.
+# ---------------------------------------------------------------------------
+
+_ARTICLE_TAG_RE = re.compile(
+    r"<(article|main)\b[^>]*>(.*?)</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_full_content(url: str, session: requests.Session) -> str:
+    if not url:
+        return ""
+    try:
+        r = session.get(url, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+    except requests.RequestException:
+        return ""
+
+    body = r.text
+    if HAS_READABILITY:
+        try:
+            doc = _ReadabilityDocument(body)
+            summary = doc.summary(html_partial=True) or ""
+            if summary.strip():
+                return summary
+        except Exception:
+            # Fall through to the tag-based fallback
+            pass
+
+    m = _ARTICLE_TAG_RE.search(body)
+    return m.group(2) if m else ""
+
+
 def _pick_thumbnail(entry) -> str:
     for key in ("media_thumbnail", "media_content"):
         val = entry.get(key)
@@ -345,17 +397,25 @@ def _pick_thumbnail(entry) -> str:
 # Feed refresh worker
 # ---------------------------------------------------------------------------
 
-def fetch_feed(feed: Feed, session: requests.Session) -> tuple[Feed, list[Article]]:
-    headers = {}
-    if feed.etag:
-        headers["If-None-Match"] = feed.etag
-    if feed.modified:
-        headers["If-Modified-Since"] = feed.modified
+def fetch_feed(
+    feed: Feed,
+    session: requests.Session,
+    force: bool = False,
+) -> tuple[Feed, list[Article]]:
+    """Fetch and parse one feed. If `force` is True, we skip the ETag /
+    If-Modified-Since headers so the server can't respond with 304 — used
+    for the manual Refresh button so it always retrieves fresh content."""
+    headers: dict[str, str] = {}
+    if not force:
+        if feed.etag:
+            headers["If-None-Match"] = feed.etag
+        if feed.modified:
+            headers["If-Modified-Since"] = feed.modified
 
     parsed = feedparser.parse(
         feed.url,
-        etag=feed.etag or None,
-        modified=feed.modified or None,
+        etag=None if force else (feed.etag or None),
+        modified=None if force else (feed.modified or None),
         request_headers=headers,
         agent=USER_AGENT,
     )
@@ -430,6 +490,12 @@ class App:
         self.thumb_images: dict[str, ImageTk.PhotoImage] = {}
         self.event_queue: queue.Queue = queue.Queue()
         self._articles_dirty = False
+        # Track article IDs where we've already attempted full-text
+        # extraction so a failed fetch doesn't retry on every re-select.
+        self._content_tried: set[str] = set()
+        for aid, a in self.articles.items():
+            if a.content:
+                self._content_tried.add(aid)
 
         self._build_ui()
         self._render_feed_list()
@@ -469,7 +535,7 @@ class App:
         entry.bind("<Return>", lambda _e: self._on_add_feed())
 
         ttk.Button(top, text="Add", command=self._on_add_feed).pack(side=tk.LEFT)
-        ttk.Button(top, text="Refresh", command=self._trigger_refresh).pack(
+        ttk.Button(top, text="Refresh", command=self._trigger_manual_refresh).pack(
             side=tk.LEFT, padx=(6, 0)
         )
 
@@ -590,10 +656,26 @@ class App:
             if article.published else "—"
         self.preview_meta.configure(text=f"{article.feed_title} · {when}")
 
+        # Prefer the extracted full-text content over the feed's own summary
+        # (which is often truncated). Fetch full-text lazily on first view.
+        body_html = article.content or article.summary
         self.preview_text.configure(state=tk.NORMAL)
         self.preview_text.delete("1.0", tk.END)
-        self.preview_text.insert(tk.END, html_to_text(article.summary))
+        self.preview_text.insert(tk.END, html_to_text(body_html))
         self.preview_text.configure(state=tk.DISABLED)
+
+        if (
+            not article.content
+            and article.link
+            and article.id not in self._content_tried
+        ):
+            self._content_tried.add(article.id)
+            self.status_var.set("Fetching full text…")
+            threading.Thread(
+                target=self._load_full_content_async,
+                args=(article.id, article.link),
+                daemon=True,
+            ).start()
 
         if article.thumbnail_url and HAS_PIL:
             threading.Thread(
@@ -603,6 +685,10 @@ class App:
             ).start()
         else:
             self.thumb_label.configure(image="")
+
+    def _load_full_content_async(self, article_id: str, url: str) -> None:
+        content = extract_full_content(url, self.session)
+        self.event_queue.put(("full_content", article_id, content))
 
     def _load_thumbnail_async(self, url: str) -> None:
         path = fetch_thumbnail(url, self.session)
@@ -680,8 +766,10 @@ class App:
         if article and article.link:
             webbrowser.open(article.link)
 
-    def _trigger_refresh(self) -> None:
-        self.event_queue.put(("trigger_refresh", None))
+    def _trigger_manual_refresh(self) -> None:
+        # force=True so the server can't respond with 304 Not Modified —
+        # a manual click should really re-pull each feed.
+        self.event_queue.put(("trigger_refresh", True))
 
     # ---- background refresh -----------------------------------------------
 
@@ -693,22 +781,27 @@ class App:
             self._refresh_once()
             time.sleep(REFRESH_INTERVAL_SEC)
 
-    def _refresh_once(self) -> None:
+    def _refresh_once(self, force: bool = False) -> None:
         if not self.feeds:
             return
-        self.event_queue.put(("status", "Refreshing feeds…"))
-        new_count = 0
+        self.event_queue.put((
+            "status",
+            "Refreshing feeds (force)…" if force else "Refreshing feeds…",
+        ))
+        fetched = 0
         for feed in list(self.feeds):
             try:
-                updated_feed, articles = fetch_feed(feed, self.session)
+                updated_feed, articles = fetch_feed(feed, self.session, force=force)
             except Exception as exc:  # noqa: BLE001 - never kill worker
                 self.event_queue.put(("status", f"Error on {feed.url}: {exc}"))
                 continue
             self.event_queue.put(("articles", updated_feed, articles))
-            new_count += len(articles)
+            fetched += len(articles)
         self.event_queue.put((
             "status",
-            f"Refreshed {len(self.feeds)} feed(s), {new_count} entries.",
+            f"Refreshed {len(self.feeds)} feed(s). "
+            f"{fetched} entries fetched, "
+            f"{len(self.articles)} total in cache.",
         ))
         save_feeds(self.feeds)
 
@@ -773,7 +866,28 @@ class App:
             self.thumb_images[url] = photo  # keep reference
             self.thumb_label.configure(image=photo)
         elif kind == "trigger_refresh":
-            threading.Thread(target=self._refresh_once, daemon=True).start()
+            force = bool(evt[1])
+            threading.Thread(
+                target=self._refresh_once, args=(force,), daemon=True
+            ).start()
+        elif kind == "full_content":
+            aid, content = evt[1], evt[2]
+            article = self.articles.get(aid)
+            if article is None:
+                return
+            if not content:
+                self.status_var.set(
+                    "Full text not available — showing feed summary."
+                )
+                return
+            article.content = content
+            self._articles_dirty = True
+            save_articles(self.articles.values())
+            self._articles_dirty = False
+            self.status_var.set("Full text loaded.")
+            sel = self.article_tree.selection()
+            if sel and sel[0] == aid:
+                self._render_preview(article)
 
     def _refresh_single(self, feed: Feed) -> None:
         try:

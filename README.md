@@ -8,12 +8,21 @@ and a JSON file on disk for feed storage.
 ## Features
 
 - Add feeds by pasting a URL — no OPML importer, no cloud sync, no telemetry.
-- Refresh feeds manually or on a background timer.
+- **Refresh** button force-refetches every feed (bypassing ETag /
+  If-Modified-Since caching) so it really pulls fresh content; the
+  background timer still does polite conditional GETs every 15 minutes.
+- **Full-text articles** — when a feed only ships an excerpt, the app
+  fetches the article URL on click and runs Readability-style extraction
+  (via `readability-lxml`, à la
+  [FiveFilters Full-Text RSS](https://help.fivefilters.org/full-text-rss/code-example.html))
+  to pull the main body. Cached back to `articles.json` so it happens
+  once per article.
 - Article list with title, source, published-at, and an inline preview pane.
 - Image thumbnails are downscaled and compressed to keep RAM use flat.
-- Notification chime is a tiny bundled WAV (~4 KB) played via `aplay`.
+- Notification chime is a tiny bundled WAV (~2 KB) played via `aplay`.
 - Reader-mode preview strips scripts and inline styles for a clean read.
-- Feed store lives in `~/.feedmesomepi/feeds.json`; delete it to reset.
+- Feed store lives in `~/.feedmesomepi/feeds.json`; article cache in
+  `articles.json` — delete either to reset.
 
 ## Install (on the Pi)
 

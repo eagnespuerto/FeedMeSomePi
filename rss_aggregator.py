@@ -46,6 +46,7 @@ except ImportError:
 APP_NAME = "FeedMeSomePi"
 CONFIG_DIR = Path(os.path.expanduser("~")) / ".feedmesomepi"
 FEEDS_FILE = CONFIG_DIR / "feeds.json"
+ARTICLES_FILE = CONFIG_DIR / "articles.json"
 CACHE_DIR = CONFIG_DIR / "cache"
 THUMB_SIZE = (96, 96)
 REFRESH_INTERVAL_SEC = 15 * 60
@@ -109,6 +110,31 @@ class Article:
     def id(self) -> str:
         return self._id
 
+    def to_dict(self) -> dict:
+        return {
+            "feed_url": self.feed_url,
+            "feed_title": self.feed_title,
+            "title": self.title,
+            "link": self.link,
+            "summary": self.summary,
+            "published": self.published,
+            "thumbnail_url": self.thumbnail_url,
+            "seen": self.seen,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Article":
+        return cls(
+            feed_url=data["feed_url"],
+            feed_title=data.get("feed_title", ""),
+            title=data.get("title", "(untitled)"),
+            link=data.get("link", ""),
+            summary=data.get("summary", ""),
+            published=data.get("published", 0.0),
+            thumbnail_url=data.get("thumbnail_url", ""),
+            seen=data.get("seen", False),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -132,6 +158,48 @@ def save_feeds(feeds: Iterable[Feed]) -> None:
         encoding="utf-8",
     )
     tmp.replace(FEEDS_FILE)
+
+
+# Article cache — persist article metadata (title / summary text / link /
+# timestamps / seen state) so the app opens with content immediately and
+# the background refresh only has to fetch deltas. Only text and URLs are
+# stored here; article thumbnails live in CACHE_DIR as JPEGs and audio
+# enclosures (podcasts etc.) are never downloaded.
+
+def load_articles() -> dict[str, Article]:
+    if not ARTICLES_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(ARTICLES_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    out: dict[str, Article] = {}
+    for d in raw.get("articles", []):
+        try:
+            a = Article.from_dict(d)
+        except (KeyError, TypeError):
+            continue
+        out[a.id] = a
+    return out
+
+
+def save_articles(articles: Iterable[Article]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Cap per-feed to MAX_ENTRIES_PER_FEED so the cache doesn't grow
+    # unbounded on long-lived installs.
+    by_feed: dict[str, list[Article]] = {}
+    for a in articles:
+        by_feed.setdefault(a.feed_url, []).append(a)
+    kept: list[Article] = []
+    for feed_url, items in by_feed.items():
+        items.sort(key=lambda a: a.published, reverse=True)
+        kept.extend(items[:MAX_ENTRIES_PER_FEED])
+    tmp = ARTICLES_FILE.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps({"articles": [a.to_dict() for a in kept]}),
+        encoding="utf-8",
+    )
+    tmp.replace(ARTICLES_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -358,13 +426,19 @@ class App:
         self.session.headers["User-Agent"] = USER_AGENT
 
         self.feeds: list[Feed] = load_feeds()
-        self.articles: dict[str, Article] = {}
-        self.seen_ids: set[str] = set()
+        self.articles: dict[str, Article] = load_articles()
         self.thumb_images: dict[str, ImageTk.PhotoImage] = {}
         self.event_queue: queue.Queue = queue.Queue()
+        self._articles_dirty = False
 
         self._build_ui()
         self._render_feed_list()
+        self._render_articles()
+        if self.articles:
+            self.status_var.set(
+                f"Loaded {len(self.articles)} cached articles. "
+                f"Next refresh in the background."
+            )
         self.root.after(200, self._pump_events)
 
         threading.Thread(target=self._refresh_loop, daemon=True).start()
@@ -574,6 +648,7 @@ class App:
             if a.feed_url == feed.url:
                 del self.articles[aid]
         save_feeds(self.feeds)
+        save_articles(self.articles.values())
         self._render_feed_list()
         self._render_articles()
 
@@ -586,7 +661,7 @@ class App:
             return
         if not article.seen:
             article.seen = True
-            self.seen_ids.add(article.id)
+            self._articles_dirty = True
             self.article_tree.item(sel[0], values=(
                 article.title,
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(article.published))
@@ -680,7 +755,10 @@ class App:
                 self.articles[a.id] = a
                 newly_added += 1
             if newly_added:
+                self._articles_dirty = True
                 play_notify()
+                save_articles(self.articles.values())
+                self._articles_dirty = False
             self._render_feed_list()
             self._render_articles()
         elif kind == "thumb":
@@ -709,6 +787,8 @@ class App:
 
     def _on_close(self) -> None:
         save_feeds(self.feeds)
+        if self._articles_dirty:
+            save_articles(self.articles.values())
         self.root.destroy()
 
 

@@ -22,5 +22,19 @@ echo "==> Installing Python deps"
 pip install --upgrade pip
 pip install -r requirements.txt
 
+echo "==> Installing desktop entry under the Internet menu"
+# Categories=Network;News; lands the launcher in PiOS's "Internet" menu
+# group. We substitute the absolute install path into the Exec= line so
+# the launcher works no matter where the user cloned the repo.
+desktop_src="assets/feedmesomepi.desktop.in"
+desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$desktop_dir"
+sed "s|@INSTALL_DIR@|$PWD|g" "$desktop_src" \
+    > "$desktop_dir/feedmesomepi.desktop"
+chmod 644 "$desktop_dir/feedmesomepi.desktop"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$desktop_dir" >/dev/null 2>&1 || true
+fi
+
 echo
-echo "Done. Run ./run.sh to launch FeedMeSomePi."
+echo "Done. Launch FeedMeSomePi from the Internet menu, or run ./run.sh."

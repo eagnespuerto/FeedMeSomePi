@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=FeedMeSomePi
+GenericName=RSS Reader
+Comment=Tiny RSS aggregator for Raspberry Pi
+Exec=@INSTALL_DIR@/run.sh
+Icon=internet-news-reader
+Terminal=false
+Categories=Network;News;
+Keywords=RSS;Atom;Feed;News;Aggregator;
+StartupNotify=true
+StartupWMClass=FeedMeSomePi

@@ -492,7 +492,11 @@ class App:
         self._articles_dirty = False
         # Track article IDs where we've already attempted full-text
         # extraction so a failed fetch doesn't retry on every re-select.
+        # `_content_failed` holds IDs where extraction returned nothing —
+        # so we can render "Full text not available" instead of "Loading…"
+        # when the user reopens them.
         self._content_tried: set[str] = set()
+        self._content_failed: set[str] = set()
         for aid, a in self.articles.items():
             if a.content:
                 self._content_tried.add(aid)
@@ -599,6 +603,17 @@ class App:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.preview_text.configure(yscrollcommand=scroll.set, state=tk.DISABLED)
 
+        # Tags for the two-section layout (summary on top, full text below).
+        section_font = (base_font.cget("family"), base_font.cget("size"), "bold")
+        placeholder_font = (base_font.cget("family"), base_font.cget("size"), "italic")
+        self.preview_text.tag_configure(
+            "section", font=section_font, spacing1=8, spacing3=4,
+            foreground="#333",
+        )
+        self.preview_text.tag_configure(
+            "placeholder", font=placeholder_font, foreground="#888",
+        )
+
         self.open_btn = ttk.Button(
             right, text="Open in browser", command=self._open_current_in_browser
         )
@@ -656,14 +671,36 @@ class App:
             if article.published else "—"
         self.preview_meta.configure(text=f"{article.feed_title} · {when}")
 
-        # Prefer the extracted full-text content over the feed's own summary
-        # (which is often truncated). Fetch full-text lazily on first view.
-        body_html = article.content or article.summary
+        summary_text = html_to_text(article.summary) or "(no summary)"
+
+        # Two-section layout: summary on top (always from the feed itself),
+        # full text underneath. Full text section states:
+        #   - loaded    → article.content is non-empty → render it
+        #   - pending   → we've started a fetch → "Loading full text…"
+        #   - failed    → fetch returned nothing → "Full text not available."
+        #   - no link   → hide the section entirely
         self.preview_text.configure(state=tk.NORMAL)
         self.preview_text.delete("1.0", tk.END)
-        self.preview_text.insert(tk.END, html_to_text(body_html))
+
+        self.preview_text.insert(tk.END, "Summary\n", "section")
+        self.preview_text.insert(tk.END, summary_text + "\n")
+
+        if article.link:
+            self.preview_text.insert(tk.END, "\nFull text\n", "section")
+            if article.content:
+                self.preview_text.insert(tk.END, html_to_text(article.content))
+            elif article.id in self._content_failed:
+                self.preview_text.insert(
+                    tk.END, "Full text not available.", "placeholder"
+                )
+            else:
+                self.preview_text.insert(
+                    tk.END, "Loading full text…", "placeholder"
+                )
+
         self.preview_text.configure(state=tk.DISABLED)
 
+        # Kick off the fetch if we haven't already for this article.
         if (
             not article.content
             and article.link
@@ -875,18 +912,22 @@ class App:
             article = self.articles.get(aid)
             if article is None:
                 return
+            sel = self.article_tree.selection()
+            still_selected = bool(sel) and sel[0] == aid
             if not content:
+                self._content_failed.add(aid)
                 self.status_var.set(
                     "Full text not available — showing feed summary."
                 )
+                if still_selected:
+                    self._render_preview(article)
                 return
             article.content = content
             self._articles_dirty = True
             save_articles(self.articles.values())
             self._articles_dirty = False
             self.status_var.set("Full text loaded.")
-            sel = self.article_tree.selection()
-            if sel and sel[0] == aid:
+            if still_selected:
                 self._render_preview(article)
 
     def _refresh_single(self, feed: Feed) -> None:

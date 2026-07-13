@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local runtime state — never commit user's feed list
+feeds.json
+cache/
